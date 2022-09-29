@@ -1,39 +1,8 @@
-use std::net::SocketAddr;
+mod connection;
 
-use async_trait::async_trait;
 use tracing::trace;
 
-#[derive(Debug)]
-struct Packet; // TODO
-#[derive(Debug)]
-struct ConnectionError; // TODO
-#[derive(Debug)]
-struct ServerAddress(SocketAddr); // TODO: make more generic?
-
-#[async_trait]
-trait Connection {
-    async fn send(&self, server: ServerAddress, packet: Packet) -> Result<(), ConnectionError>;
-    async fn listen(&mut self, listen_socket: ServerAddress) -> Result<(), ConnectionError>;
-    async fn receive(&mut self) -> Result<Packet, ConnectionError>;
-}
-
-struct DummyConnection;
-
-#[async_trait]
-impl Connection for DummyConnection {
-    async fn send(&self, server: ServerAddress, packet: Packet) -> Result<(), ConnectionError> {
-        trace!(?server, ?packet);
-        Ok(()) // TODO
-    }
-    async fn listen(&mut self, listen_socket: ServerAddress) -> Result<(), ConnectionError> {
-        trace!(?listen_socket);
-        Ok(()) // TODO
-    }
-    async fn receive(&mut self) -> Result<Packet, ConnectionError> {
-        trace!("receive");
-        Ok(Packet) // TODO
-    }
-}
+use crate::connection::{Connection, ConnectionError, DummyConnection, ServerAddress};
 
 struct Server<C: Connection> {
     connection: C,
