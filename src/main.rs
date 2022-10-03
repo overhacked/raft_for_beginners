@@ -1,7 +1,10 @@
 mod config;
 mod connection;
 
+use std::time::Duration;
+
 use clap::Parser;
+use tokio::time::sleep;
 use tracing::trace;
 
 use crate::config::Config;
@@ -9,26 +12,52 @@ use crate::connection::{Connection, ConnectionError, udp::UdpConnection, ServerA
 
 struct Server<C: Connection> {
     connection: C,
+    peers: Vec<ServerAddress>,
+    heartbeat_interval: Duration,
 }
 
 impl<C: Connection> Server<C> {
-    fn new(connection: C) -> Self {
+    fn new(connection: C, peers: Vec<ServerAddress>, heartbeat_interval: Duration) -> Self {
         Self {
             connection,
+            peers,
+            heartbeat_interval,
         }
     }
 
+    async fn receive_packet(&mut self) -> Result<Packet, ConnectionError> {
+        let packet = self.connection.receive().await?;
+        let parsed = String::from_utf8_lossy(&packet.data);
+        trace!(?packet, %parsed);
+        Ok(packet)
+    }
+
     async fn run(mut self) -> Result<(), ConnectionError> {
-        while let Ok(packet) = self.connection.receive().await { // TODO: handle receive error?
-            let parsed = String::from_utf8_lossy(&packet.data);
-            trace!(?packet, %parsed);
-            let reply = Packet {
-                data: "BONG\n".into(),
-                peer: packet.peer,
-            };
-            let _who_cares = self.connection.send(reply).await; // TODO
+        let heartbeat_interval = self.heartbeat_interval.clone();
+        loop {
+            tokio::select! {
+                packet = self.receive_packet() => {
+                    let packet = packet.expect("HANDLE RECEIVE ERROR");
+                    if packet.data == b"HEARTBEAT" {
+                        let reply = Packet {
+                            data: "ACK HEARTBEAT".into(),
+                            peer: packet.peer,
+                        };
+                        let _who_cares = self.connection.send(reply).await; // TODO
+                    }
+                },
+                _ = sleep(heartbeat_interval) => {
+                    for peer in &self.peers {
+                        let peer_request = Packet {
+                            data: "HEARTBEAT".into(),
+                            peer: peer.to_owned(),
+                        };
+                        let _who_cares = self.connection.send(peer_request).await; // TODO
+                    }
+                }
+            }
         } 
-        Ok(())
+        //Ok(())
     }
 }
 
@@ -45,6 +74,6 @@ async fn main() {
     let opts = Config::parse();
 
     let connection = UdpConnection::bind(opts.listen_socket).await.unwrap();
-    let server = Server::new(connection);
+    let server = Server::new(connection, opts.peers, opts.heartbeat_interval);
     server.run().await.expect("server.run panicked");
 }

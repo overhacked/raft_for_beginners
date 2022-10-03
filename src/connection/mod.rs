@@ -18,7 +18,7 @@ impl Packet {
     }
 }
 
-#[derive(Debug, FromStr)]
+#[derive(Clone, Debug, FromStr)]
 pub struct ServerAddress(pub SocketAddr); // TODO: make more generic?
 
 #[derive(Debug)]
