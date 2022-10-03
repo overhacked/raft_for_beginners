@@ -1,8 +1,11 @@
+mod config;
 mod connection;
 
+use clap::Parser;
 use tracing::trace;
 
-use crate::connection::{Connection, ConnectionError, DummyConnection, ServerAddress};
+use crate::config::Config;
+use crate::connection::{Connection, ConnectionError, udp::UdpConnection, ServerAddress, Packet};
 
 struct Server<C: Connection> {
     connection: C,
@@ -15,11 +18,16 @@ impl<C: Connection> Server<C> {
         }
     }
 
-    async fn run(mut self, listen_socket: ServerAddress) -> Result<(), ConnectionError> {
-        self.connection.listen(listen_socket).await?;
+    async fn run(mut self) -> Result<(), ConnectionError> {
         while let Ok(packet) = self.connection.receive().await { // TODO: handle receive error?
-            trace!(?packet);
-        }
+            let parsed = String::from_utf8_lossy(&packet.data);
+            trace!(?packet, %parsed);
+            let reply = Packet {
+                data: "BONG\n".into(),
+                peer: packet.peer,
+            };
+            let _who_cares = self.connection.send(reply).await; // TODO
+        } 
         Ok(())
     }
 }
@@ -34,8 +42,9 @@ async fn main() {
     let subscriber = Registry::default().with(tracing_tree::HierarchicalLayer::new(2));
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
-    let connection = DummyConnection;
-    let listen_socket = ServerAddress("127.0.0.1:8000".parse().unwrap());
+    let opts = Config::parse();
+
+    let connection = UdpConnection::bind(opts.listen_socket).await.unwrap();
     let server = Server::new(connection);
-    server.run(listen_socket).await.expect("server.run panicked");
+    server.run().await.expect("server.run panicked");
 }
