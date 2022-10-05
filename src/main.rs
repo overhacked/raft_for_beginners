@@ -25,15 +25,14 @@ impl<C: Connection> Server<C> {
         }
     }
 
-    async fn receive_packet(&mut self) -> Result<Packet, ConnectionError> {
+    async fn receive_packet(&self) -> Result<Packet, ConnectionError> {
         let packet = self.connection.receive().await?;
         let parsed = String::from_utf8_lossy(&packet.data);
         trace!(?packet, %parsed);
         Ok(packet)
     }
 
-    async fn run(mut self) -> Result<(), ConnectionError> {
-        let heartbeat_interval = self.heartbeat_interval.clone();
+    async fn run(self) -> Result<(), ConnectionError> {
         loop {
             tokio::select! {
                 packet = self.receive_packet() => {
@@ -46,7 +45,7 @@ impl<C: Connection> Server<C> {
                         let _who_cares = self.connection.send(reply).await; // TODO
                     }
                 },
-                _ = sleep(heartbeat_interval) => {
+                _ = sleep(self.heartbeat_interval) => {
                     for peer in &self.peers {
                         let peer_request = Packet {
                             data: "HEARTBEAT".into(),

@@ -26,7 +26,7 @@ impl Connection for UdpConnection {
         Ok(()) // TODO
     }
 
-    async fn receive(&mut self) -> Result<Packet, ConnectionError> {
+    async fn receive(&self) -> Result<Packet, ConnectionError> {
         let mut buf = vec![0; 65536];
         let (bytes_received, peer_addr) = self.socket.recv_from(&mut buf).await
             .expect("TODO: handle error");

@@ -28,7 +28,7 @@ pub struct ConnectionError; // TODO
 pub trait Connection: Sized {
     async fn bind(bind_socket: ServerAddress) -> Result<Self, ConnectionError>;
     async fn send(&self, packet: Packet) -> Result<(), ConnectionError>;
-    async fn receive(&mut self) -> Result<Packet, ConnectionError>;
+    async fn receive(&self) -> Result<Packet, ConnectionError>;
 }
 
 pub struct DummyConnection;
@@ -44,7 +44,7 @@ impl Connection for DummyConnection {
         Ok(()) // TODO
     }
 
-    async fn receive(&mut self) -> Result<Packet, ConnectionError> {
+    async fn receive(&self) -> Result<Packet, ConnectionError> {
         trace!("receive");
         Ok(Packet {
             data: Vec::new(),
