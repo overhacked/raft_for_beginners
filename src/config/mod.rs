@@ -14,6 +14,10 @@ pub struct Config {
     #[clap(short, long = "peer")]
     pub peers: Vec<ServerAddress>,
 
+    /// Are we the leader?
+    #[clap(long)]
+    pub leader: bool,
+
     /// Heartbeat interval in milliseconds
     #[clap(long = "heartbeat", parse(try_from_str = parse_millis), default_value = "500")]
     pub heartbeat_interval: Duration,
