@@ -25,7 +25,7 @@ pub struct ServerAddress(pub SocketAddr); // TODO: make more generic?
 pub struct ConnectionError; // TODO
 
 #[async_trait]
-pub trait Connection: Sized {
+pub trait Connection: Sized + Send + Sync + 'static {
     async fn bind(bind_socket: ServerAddress) -> Result<Self, ConnectionError>;
     async fn send(&self, packet: Packet) -> Result<(), ConnectionError>;
     async fn receive(&self) -> Result<Packet, ConnectionError>;
