@@ -201,8 +201,7 @@ impl Server {
                                             term: current_term,
                                             peer: packet.peer,
                                         };
-                                        outgoing.send(reply).await.unwrap(); // TODO
-                                        // CAST THE VOTE
+                                        outgoing.send(reply).await.unwrap();
                                     },
                                     _ => { unimplemented!("Invalid request type"); },
                                 }
