@@ -21,7 +21,8 @@ impl Connection for UdpConnection {
 
     async fn send(&self, packet: Packet) -> Result<(), ConnectionError> {
         trace!(?packet, "send");
-        self.socket.send_to(packet.as_bytes(), packet.peer.0).await
+        let data = postcard::to_allocvec(&packet).expect("serialization failed");
+        self.socket.send_to(&data, packet.peer.0).await
             .expect("TODO: handle error");
         Ok(()) // TODO
     }
@@ -33,9 +34,7 @@ impl Connection for UdpConnection {
         buf.truncate(bytes_received);
         trace!(?peer_addr, bytes_received, "receive"); // DEBUG
 
-        Ok(Packet {
-            data: buf,
-            peer: ServerAddress(peer_addr),
-        })
+        let packet = postcard::from_bytes(&buf).expect("deserialization failed");
+        Ok(packet)
     }
 }

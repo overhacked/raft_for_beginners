@@ -1,6 +1,8 @@
 mod config;
 mod connection;
 
+use std::collections::HashMap;
+use std::iter;
 use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
 use std::time::Duration;
 
@@ -12,13 +14,25 @@ use tokio::time::sleep;
 use tracing::trace;
 use k9::{assert_greater_than, assert_lesser_than};
 use rand::Rng;
-
+use atomic_enum::atomic_enum;
 
 use crate::config::Config;
-use crate::connection::{Connection, ConnectionError, udp::UdpConnection, ServerAddress, Packet};
+use crate::connection::{Connection, ConnectionError, udp::UdpConnection, ServerAddress, Packet, PacketType::*};
+
+#[atomic_enum]
+#[derive(PartialEq)]
+enum ServerState {
+    Follower = 0,
+    Candidate,
+    Leader,
+}
 
 struct Server {
     peers: RwLock<Vec<ServerAddress>>,
+    state: AtomicServerState,
+    election_results: Mutex<HashMap<ServerAddress, bool>>,
+    last_vote: Mutex<Option<ServerAddress>>,
+    term: AtomicU64,
     heartbeat_millis: AtomicU64,
     election_timeout_min: AtomicU64,
     election_timeout_max: AtomicU64,
@@ -38,17 +52,23 @@ impl Server {
         Duration::from_millis(timeout)
     }
 
+    async fn reset_election_results(&self) {
+        let mut election_results = self.election_results.lock().await;
+        let peers = self.peers.read().await;
+        *election_results = peers.iter().cloned().zip(iter::repeat(false)).collect();
+    }
+
     /// Get and send packets!
-    async fn connection_loop(mut connection: impl Connection, incoming: Sender<Packet>, mut outgoing: Receiver<Packet>) -> Result<(), ConnectionError> {
+    async fn connection_loop(connection: impl Connection, incoming: Sender<Packet>, mut outgoing: Receiver<Packet>) -> Result<(), ConnectionError> {
         loop {
             tokio::select! {
                 packet = connection.receive() => {
                     let packet = packet?;
-                    trace!(?packet, parsed = %String::from_utf8_lossy(&packet.data), "receive");
+                    trace!(?packet, "receive");
                     incoming.try_send(packet).expect("TODO: ConnectionError");
                 },
                 Some(packet) = outgoing.recv() => {
-                    trace!(?packet, parsed = %String::from_utf8_lossy(&packet.data), "send");
+                    trace!(?packet, "send");
                     connection.send(packet).await?;
                 },
             }
@@ -61,64 +81,156 @@ impl Server {
         let mut interval = tokio::time::interval(current_interval);
 
         loop {
+            // TODO: make this less bad
             let instant = interval.tick().await;
-            let peers = self.peers.read().await;
-            for peer in peers.iter() {
-                let peer_request = Packet {
-                    data: "HEARTBEAT".into(),
-                    peer: peer.to_owned(),
-                };
-                outgoing.send(peer_request).await.unwrap(); // TODO
-                let new_interval= self.get_current_duration();
-                if new_interval != current_interval {
-                    interval = tokio::time::interval_at(instant + new_interval, new_interval);
+
+
+            match self.state.load(Ordering::Relaxed) {
+                ServerState::Leader => {
+                    // 1. we are leader
+                        // send send heart beat?
+                    let peers = self.peers.read().await;
+                    for peer in peers.iter() {
+                        let peer_request = Packet {
+                            message_type: AppendEntries,
+                            term: self.term.load(Ordering::Acquire),
+                            peer: peer.to_owned(),
+                        };
+                        outgoing.send(peer_request).await.unwrap(); // TODO
+                        let new_interval= self.get_current_duration();
+                        if new_interval != current_interval {
+                            interval = tokio::time::interval_at(instant + new_interval, new_interval);
+                        }
+                    }
+                },
+                ServerState::Candidate => {
+                    // 2. we are candidate  
+                        // increment term
+                        // send out request for votes
+                        // timeout if we don't get enough votes
+                    let peers = self.peers.read().await;
+                    for peer in peers.iter() {
+                        let current_term = self.term.load(Ordering::Acquire);
+                        let peer_request = Packet {
+                            message_type: VoteRequest { last_log_index: 0, last_log_term: current_term - 1 }, // TODO: THIS IS THE WRONG TERM, it should come from the log and doesn't need the -1
+                            term: current_term,
+                            peer: peer.to_owned(),
+                        };
+                        outgoing.send(peer_request).await.unwrap(); // TODO
+                    }
+                },
+                ServerState::Follower => {
+                    // 3. we are follower
+                        // do nothing for now
                 }
             }
         }
     }
 
-    /// TODO: Leader packet processing
-    async fn process_follower_messages_loop(self: Arc<Self>, mut incoming: Receiver<Packet>, _outgoing: Sender<Packet>) -> Result<(), ConnectionError> {
-        while let Some(_packet) = incoming.recv().await {
-            // DO ABSOLUTELY NOTHING
-        }
-        Ok(())
-    }
-
     /// Get heartbeats and work out who is dead
-    async fn process_leader_heartbeat_loop(self: Arc<Self>, mut incoming: Receiver<Packet>, outgoing: Sender<Packet>) -> Result<(), ConnectionError> {
+    async fn incoming_packet_loop(self: Arc<Self>, mut incoming: Receiver<Packet>, outgoing: Sender<Packet>) -> Result<(), ConnectionError> {
         loop {
-            // get the next peer we expect to timeout
-            let interval = self.get_current_timeout();
 
-            tokio::select! {
-                // process heartbeats from leader
-                received = incoming.recv() => match received {
-                    None => return Ok(()),
-                    Some(packet) => {
-                        if packet.data == b"HEARTBEAT" {
-                            let reply = Packet {
-                                data: "ACK HEARTBEAT".into(),
-                                peer: packet.peer,
-                            };
-                            outgoing.send(reply).await.unwrap(); // TODO
-                        }
-                    },
+            match self.state.load(Ordering::Relaxed) {
+                ServerState::Leader => {
+                    // 1. we are leader
+                        // nothing for now
                 },
+                ServerState::Candidate => {
+                    // 2. we are candidate
+                        // if we find a valid leader, become follower
+                        // become leader if we get majority of votes
+                    tracing::warn!("We would do some candidate stuff here");
+                    std::process::exit(1);
+                },
+                ServerState::Follower => {
+                    // 3. we are follower
+                        // if we get a heartbeat, reset our timeout
+                        // if we timeout, become candidate
+                        // send vote if valid vote request
 
-                // timer that goes off when leader timed out
-                _ = sleep(interval) => {
-                    tracing::info!("Leader timeout, waited {:?}ms", interval);
-                    tracing::warn!("Leader timeout, would start an election here");
+                    let interval = self.get_current_timeout();
+                    tokio::select! {
+                        // process heartbeats from leader
+                        received = incoming.recv() => match received {
+                            None => return Ok(()),
+                            Some(packet) => {
+                                // TODO: make this less naive
+                                match packet.message_type {
+                                    AppendEntries => {
+                                        let reply = Packet {
+                                            message_type: AppendEntriesAck,
+                                            term: self.term.load(Ordering::Acquire),
+                                            peer: packet.peer,
+                                        };
+                                        outgoing.send(reply).await.unwrap(); // TODO
+                                    },
+                                    VoteRequest { last_log_index, last_log_term } => {
+                                        let mut current_term = self.term.load(Ordering::Acquire);
+                                        let vote_granted = if packet.term >= current_term {
+                                            let mut last_vote = self.last_vote.lock().await;
+
+                                            if packet.term > current_term {
+                                                // the term in the packet is newer, so update, and also clear any existing vote...
+                                                current_term = self.term.compare_exchange(current_term, packet.term, Ordering::Acquire, Ordering::Acquire).expect("Handle concurrency failure");
+                                                *last_vote = None;
+                                            }
+
+                                            match &*last_vote {
+                                                None => { 
+                                                    // We didn't vote... --> true vote
+                                                    true
+                                                },
+                                                Some(p) if p == &packet.peer => {
+                                                    // or we voted for this peer already --> true vote
+                                                    // TODO: Is packet last_log_index last_log_term as up to date as our log?
+                                                    true
+                                                },
+                                                Some(_) => {
+                                                    // We already voted, and it wasn't for this peer --> False vote
+                                                    false
+                                                }
+                                            }
+                                        } else {
+                                            // Packet term is too old
+                                            false
+                                        };
+                                        
+                                        let reply = Packet {
+                                            message_type: VoteResponse { is_granted: vote_granted },
+                                            term: current_term,
+                                            peer: packet.peer,
+                                        };
+                                        outgoing.send(reply).await.unwrap(); // TODO
+                                        // CAST THE VOTE
+                                    },
+                                    _ => { unimplemented!("Invalid request type"); },
+                                }
+                            },
+                        },
+
+                        // timer that goes off when leader timed out
+                        _ = sleep(interval) => {
+                            tracing::info!("Leader timeout, waited {:?}", interval);
+                            tracing::warn!("Leader timeout, would start an election here");
+                            self.state.store(ServerState::Candidate, Ordering::Relaxed);
+                            self.term.fetch_add(1, Ordering::Acquire);
+                            self.reset_election_results().await;
+                        }
+                    }
                 }
             }
         } 
     }
 
-    pub fn start(connection: impl Connection, is_leader: bool, peers: Vec<ServerAddress>, heartbeat_interval: Duration, election_timeout_min: Duration, election_timeout_max: Duration) -> Result<Arc<Self>, ConnectionError>
+    pub fn start(connection: impl Connection, peers: Vec<ServerAddress>, heartbeat_interval: Duration, election_timeout_min: Duration, election_timeout_max: Duration) -> Result<Arc<Self>, ConnectionError>
     {
         let server = Arc::new(Self {
             peers: RwLock::new(peers),
+            state: AtomicServerState::new(ServerState::Follower),
+            term: AtomicU64::new(0),
+            last_vote: Mutex::new(None),
+            election_results: Mutex::new(HashMap::new()),
             heartbeat_millis: AtomicU64::new(heartbeat_interval.as_millis() as u64),
             election_timeout_min: AtomicU64::new(election_timeout_min.as_millis() as u64),
             election_timeout_max: AtomicU64::new(election_timeout_max.as_millis() as u64),
@@ -131,13 +243,9 @@ impl Server {
         {
             let mut tasks = server.tasks.try_lock().expect("should be exclusive at this point");
             tasks.spawn(Self::connection_loop(connection, packets_receive_tx, packets_send_rx));
-            if is_leader {
-                tasks.spawn(Arc::clone(&server).send_heartbeat_loop(packets_send_tx.clone()));
-                tasks.spawn(Arc::clone(&server).process_follower_messages_loop(packets_receive_rx, packets_send_tx));
-            } else {
-                //tasks.spawn(Self::process_leader_heartbeat_loop(Arc::clone(&server), packets_receive_rx, packets_send_tx.clone()));
-                tasks.spawn(Arc::clone(&server).process_leader_heartbeat_loop(packets_receive_rx, packets_send_tx));
-            }
+            
+            tasks.spawn(Arc::clone(&server).send_heartbeat_loop(packets_send_tx.clone()));
+            tasks.spawn(Arc::clone(&server).incoming_packet_loop(packets_receive_rx, packets_send_tx));
         }
 
         tracing::info!("Starting Server");
@@ -178,6 +286,6 @@ async fn main() {
     assert_lesser_than!(opts.election_timeout_min, opts.election_timeout_max);
 
     let connection = UdpConnection::bind(opts.listen_socket).await.unwrap();
-    let server = Server::start(connection, opts.leader, opts.peers, opts.heartbeat_interval, opts.election_timeout_min, opts.election_timeout_max).expect("could not start server");
+    let server = Server::start(connection, opts.peers, opts.heartbeat_interval, opts.election_timeout_min, opts.election_timeout_max).expect("could not start server");
     server.run().await.expect("server.run exited with error");
 }

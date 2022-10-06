@@ -2,9 +2,7 @@ use std::{time::Duration, num::ParseIntError};
 
 use clap::Parser;
 
-use crate::connection::Packet;
-
-use super::ServerAddress;
+use crate::connection::ServerAddress;
 
 #[derive(Parser, Debug)]
 pub struct Config {
@@ -15,10 +13,6 @@ pub struct Config {
     /// A peer to connect to (use multiple times for multiple peers)
     #[clap(short, long = "peer")]
     pub peers: Vec<ServerAddress>,
-
-    /// Are we the leader?
-    #[clap(long)]
-    pub leader: bool,
 
     /// Heartbeat interval in milliseconds
     #[clap(long = "heartbeat", parse(try_from_str = parse_millis), default_value = "15")]
