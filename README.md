@@ -23,11 +23,15 @@ You can then send SIGQUIT to kill the leader `<ctrl>+\`, and or SIGINT to kill a
 - [x] A server remains in follower state as long as it receives valid RPCs from a leader or candidate.
 - [x] Leaders send periodic heartbeats (AppendEntries RPCs that carry no log entries) to all followers in order to maintain their authority. 
 - [x] If a follower receives no communication over a period of time called the election timeout, then it assumes there is no viable leader and begins an election to choose a new leader.
-- [ ] To begin an election, 
+- [x] To begin an election, 
  - [x] and transitions to candidate state. 
- - [ ] a follower increments its current term
-- [ ] It then votes for itself and issues RequestVote RPCs in parallel to each of the other servers in the cluster. 
-- [ ] A candidate continues in this state until one of three things happens: (a) it wins the election, (b) another server establishes itself as leader, or (c) a period of time goes by with no winner.
+ - [x] a follower increments its current term
+ - [x] It then votes for itself and issues RequestVote RPCs in parallel to each of the other servers in the cluster.
+   - [ ] Note `in parallel to each of the other servers`, we do this in a loop...but meh?
+- [ ] A candidate continues in this state until one of three things happens: 
+  - [ ] (a) it wins the election, 
+  - [ ] (b) another server establishes itself as leader,
+  - [ ] or (c) a period of time goes by with no winner.
 
 These outcomes are discussed separately in the paragraphs below.
 
@@ -41,12 +45,11 @@ The majority rule ensures that at most one candidate can win the election for a 
 - [ ] If the leader’s term (included in its RPC) is at least as large as the candidate’s current term, then the candidate recognizes the leader as legitimate and returns to follower state. 
 - [ ] If the term in the RPC is smaller than the candidate’s current term, then the candidate rejects the RPC and con- tinues in candidate state.
 
-- [ ] The third possible outcome is that a candidate neither wins nor loses the election: if many followers become candidates at the same time, votes could be split so that no candidate obtains a majority.
-- [ ] When this happens, each candidate will time out and start a new election by incre=menting its term and initiating another round of Request- Vote RPCs. 
-- [ ] However, without extra measures split votes could repeat indefinitely.
-
-- [ ] Raft uses randomized election timeouts to ensure that split votes are rare and that they are resolved quickly. 
-- [ ] To prevent split votes in the first place, election timeouts are chosen randomly from a fixed interval (e.g., 150–300ms). 
-- [ ] This spreads out the servers so that in most cases only a single server will time out; it wins the election and sends heartbeats before any other servers time out. 
-- [ ] The same mechanism is used to handle split votes. 
-- [ ] Each candidate restarts its randomized election timeout at the start of an election, and it waits for that timeout to elapse before starting the next election; this reduces the likelihood of another split vote in the new election. 
+- The third possible outcome is that a candidate neither wins nor loses the election: if many followers become candidates at the same time, votes could be split so that no candidate obtains a majority.
+- [ ] When this happens, each candidate will time out and start a new election by incrementing its term and initiating another round of Request-Vote RPCs. 
+- However, without extra measures split votes could repeat indefinitely.
+  - Raft uses randomized election timeouts to ensure that split votes are rare and that they are resolved quickly. 
+  - [ ] To prevent split votes in the first place, election timeouts are chosen randomly from a fixed interval (e.g., 150–300ms). 
+- This spreads out the servers so that in most cases only a single server will time out; it wins the election and sends heartbeats before any other servers time out. 
+- The same mechanism is used to handle split votes. 
+- Each candidate restarts its randomized election timeout at the start of an election, and it waits for that timeout to elapse before starting the next election; this reduces the likelihood of another split vote in the new election. 
