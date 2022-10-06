@@ -10,6 +10,9 @@ use tokio::sync::mpsc::{Sender, Receiver};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tracing::trace;
+use k9::{assert_greater_than, assert_lesser_than};
+use rand::Rng;
+
 
 use crate::config::Config;
 use crate::connection::{Connection, ConnectionError, udp::UdpConnection, ServerAddress, Packet};
@@ -17,12 +20,22 @@ use crate::connection::{Connection, ConnectionError, udp::UdpConnection, ServerA
 struct Server {
     peers: RwLock<Vec<ServerAddress>>,
     heartbeat_millis: AtomicU64,
+    election_timeout_min: AtomicU64,
+    election_timeout_max: AtomicU64,
     tasks: Mutex<JoinSet<Result<(), ConnectionError>>>,
 }
 
 impl Server {
     fn get_current_duration(&self) -> Duration {
         Duration::from_millis(self.heartbeat_millis.load(Ordering::Relaxed))
+    }
+
+    fn get_current_timeout(&self) -> Duration {
+        let min = self.election_timeout_min.load(Ordering::Relaxed);
+        let max = self.election_timeout_max.load(Ordering::Relaxed);
+        // https://stackoverflow.com/questions/19671845/how-can-i-generate-a-random-number-within-a-range-in-rust
+        let timeout = rand::thread_rng().gen_range(min..max);
+        Duration::from_millis(timeout)
     }
 
     /// Get and send packets!
@@ -76,7 +89,7 @@ impl Server {
     async fn process_leader_heartbeat_loop(self: Arc<Self>, mut incoming: Receiver<Packet>, outgoing: Sender<Packet>) -> Result<(), ConnectionError> {
         loop {
             // get the next peer we expect to timeout
-            let interval = self.get_current_duration() * 2;
+            let interval = self.get_current_timeout();
 
             tokio::select! {
                 // process heartbeats from leader
@@ -95,17 +108,20 @@ impl Server {
 
                 // timer that goes off when leader timed out
                 _ = sleep(interval) => {
+                    tracing::info!("Leader timeout, waited {:?}ms", interval);
                     tracing::warn!("Leader timeout, would start an election here");
                 }
             }
         } 
     }
 
-    pub fn start(connection: impl Connection, is_leader: bool, peers: Vec<ServerAddress>, heartbeat_interval: Duration) -> Result<Arc<Self>, ConnectionError>
+    pub fn start(connection: impl Connection, is_leader: bool, peers: Vec<ServerAddress>, heartbeat_interval: Duration, election_timeout_min: Duration, election_timeout_max: Duration) -> Result<Arc<Self>, ConnectionError>
     {
         let server = Arc::new(Self {
             peers: RwLock::new(peers),
             heartbeat_millis: AtomicU64::new(heartbeat_interval.as_millis() as u64),
+            election_timeout_min: AtomicU64::new(election_timeout_min.as_millis() as u64),
+            election_timeout_max: AtomicU64::new(election_timeout_max.as_millis() as u64),
             tasks: Mutex::new(JoinSet::default()),
         });
 
@@ -156,7 +172,12 @@ async fn main() {
 
     let opts = Config::parse();
 
+    // make sure the opts are ok
+    assert_greater_than!(opts.heartbeat_interval, Duration::new(0, 0));
+    assert_lesser_than!(opts.heartbeat_interval, opts.election_timeout_min);
+    assert_lesser_than!(opts.election_timeout_min, opts.election_timeout_max);
+
     let connection = UdpConnection::bind(opts.listen_socket).await.unwrap();
-    let server = Server::start(connection, opts.leader, opts.peers, opts.heartbeat_interval).expect("could not start server");
+    let server = Server::start(connection, opts.leader, opts.peers, opts.heartbeat_interval, opts.election_timeout_min, opts.election_timeout_max).expect("could not start server");
     server.run().await.expect("server.run exited with error");
 }

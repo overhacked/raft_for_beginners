@@ -1,6 +1,6 @@
 puts "cargo build --release --quiet"
 
-log_level = "trace"
+log_level = "info"
 peers = %w{8000 8001 8002}
 
 leader = false
@@ -15,5 +15,6 @@ leader = false
     peers.rotate!
 end
 
+puts "trap 'pkill -o raft_for_beginners; trap - QUIT' QUIT"
 puts "trap 'pkill raft_for_beginners; trap - INT' INT"
 puts "wait"
