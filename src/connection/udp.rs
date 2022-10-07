@@ -21,7 +21,7 @@ impl Connection for UdpConnection {
 
     async fn send(&self, packet: Packet) -> Result<(), ConnectionError> {
         trace!(?packet, "send");
-        let data = postcard::to_allocvec(&packet).expect("serialization failed");
+        let data = rmp_serde::to_vec(&packet).expect("serialization failed");
         self.socket.send_to(&data, packet.peer.0).await
             .expect("TODO: handle error");
         Ok(()) // TODO
@@ -34,8 +34,10 @@ impl Connection for UdpConnection {
         buf.truncate(bytes_received);
         trace!(?peer_addr, bytes_received, "receive"); // DEBUG
 
-        tracing::warn!(?buf, "TODO: deserialize packet");
-        let packet = postcard::from_bytes(&buf).expect("deserialization failed");
+        let mut packet: Packet = rmp_serde::from_slice(&buf).expect("deserialization failed");
+        // Change the peer field to be the received peer's, not the one it sent
+        // TODO: this is wrong and bad to tamper with wire data
+        packet.peer = peer_addr.into();
         Ok(packet)
     }
 }

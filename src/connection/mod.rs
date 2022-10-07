@@ -3,7 +3,7 @@ pub mod udp;
 use std::net::SocketAddr;
 
 use async_trait::async_trait;
-use derive_more::FromStr;
+use derive_more::{From, FromStr};
 use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -24,10 +24,12 @@ pub enum PacketType {
         is_granted: bool,
     },
     AppendEntries,
-    AppendEntriesAck,
+    AppendEntriesAck {
+        did_append: bool,
+    },
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, FromStr, Hash, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, From, FromStr, Hash, PartialEq, Eq)]
 pub struct ServerAddress(pub SocketAddr); // TODO: make more generic?
 
 #[derive(Debug)]

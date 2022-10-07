@@ -11,7 +11,8 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::sync::mpsc::{Sender, Receiver};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
-use tracing::trace;
+// use tracing::span::EnteredSpan;
+use tracing::{trace, info, error, instrument, Instrument};
 use k9::{assert_greater_than, assert_lesser_than};
 use rand::Rng;
 use atomic_enum::atomic_enum;
@@ -27,9 +28,11 @@ enum ServerState {
     Leader,
 }
 
+#[derive(Debug)]
 struct Server {
     peers: RwLock<Vec<ServerAddress>>,
     state: AtomicServerState,
+    // state_span: RwLock<Option<EnteredSpan>>,
     election_results: Mutex<HashMap<ServerAddress, bool>>,
     last_vote: Mutex<Option<ServerAddress>>,
     term: AtomicU64,
@@ -40,6 +43,17 @@ struct Server {
 }
 
 impl Server {
+    /*
+    async fn get_current_span(&self, desc: &'static str) -> Option<RwLockReadGuard<Span>> {
+        let state_span = self.state_span.read().await;
+        if state_span.is_none() {
+            return None;
+        }
+
+        Some(RwLockReadGuard::map(state_span, |o| o.as_ref().unwrap()))
+    }
+    */
+
     fn get_current_duration(&self) -> Duration {
         Duration::from_millis(self.heartbeat_millis.load(Ordering::Relaxed))
     }
@@ -52,10 +66,21 @@ impl Server {
         Duration::from_millis(timeout)
     }
 
-    async fn reset_election_results(&self) {
+    async fn start_election(&self) {
+        self.term.fetch_add(1, Ordering::Acquire);
         let mut election_results = self.election_results.lock().await;
         let peers = self.peers.read().await;
         *election_results = peers.iter().cloned().zip(iter::repeat(false)).collect();
+    }
+
+    async fn handle_append(&self, packet: Packet) -> Packet {
+        // TODO: actually handle the append
+        let ack = packet.term >= self.term.load(Ordering::Acquire);
+        Packet {
+            message_type: AppendEntriesAck { did_append: ack },
+            term: self.term.load(Ordering::Acquire),
+            peer: packet.peer,
+        }
     }
 
     /// Get and send packets!
@@ -132,10 +157,13 @@ impl Server {
     async fn incoming_packet_loop(self: Arc<Self>, mut incoming: Receiver<Packet>, outgoing: Sender<Packet>) -> Result<(), ConnectionError> {
         loop {
 
-            match self.state.load(Ordering::Relaxed) {
+            let server_state = self.state.load(Ordering::Relaxed);
+            match server_state {
                 ServerState::Leader => {
                     // 1. we are leader
                         // nothing for now
+                    // TODO: read and discard packets off the wire
+                    let _discard = incoming.recv().await.ok_or(ConnectionError)?;
                 },
                 ServerState::Candidate => {
                     // 2. we are candidate
@@ -148,8 +176,16 @@ impl Server {
                             Some(packet) => {
                                 // TODO: make this less naive
                                 match packet.message_type {
+                                    AppendEntries => {
+                                        let reply = self.handle_append(packet).await;
+                                        if let Packet { message_type: AppendEntriesAck { did_append: true }, .. } = reply {
+                                            info!("got valid leader packet; becoming follower");
+                                            self.state.store(ServerState::Follower, Ordering::Release);
+                                        }
+                                        outgoing.send(reply).await.unwrap(); // TODO
+                                    },
                                     VoteResponse { is_granted } => {
-                                        tracing::info!("Got a vote response");
+                                        info!("Got a vote response");
 
                                         let mut election_results = self.election_results.lock().await;
 
@@ -159,10 +195,11 @@ impl Server {
                                         // count votes and peers
                                         let vote_cnt = election_results.values().filter(|v| **v).count();
                                         let peer_cnt = self.peers.read().await.len();
-                                        tracing::info!(?vote_cnt, ?peer_cnt, "vote count, peer count");
+                                        info!(?vote_cnt, ?peer_cnt, "vote count, peer count");
 
                                         // did we get more than half the votes?
                                         if vote_cnt > peer_cnt / 2 {
+                                            info!(votes = %vote_cnt, "won election; becoming Leader");
                                             self.state.store(ServerState::Leader, Ordering::Release);
                                         }
                                     },
@@ -174,12 +211,13 @@ impl Server {
                         },
                     
                         // timer that goes off when election timed out
+                        // TODO: doesn't work
                         _ = sleep(interval) => {
-                            tracing::info!("Election timeout, waited {:?}", interval);
+                            info!("Election timeout, waited {:?}", interval);
 
                             // is this the best way to "restart" the election?
-                            tracing::warn!("Election timeout, restarting election by going back to follower");
-                            self.state.store(ServerState::Follower, Ordering::Relaxed);
+                            tracing::warn!("Election timeout, restarting election");
+                            self.start_election().await
                         }
 
                     }
@@ -199,14 +237,10 @@ impl Server {
                                 // TODO: make this less naive
                                 match packet.message_type {
                                     AppendEntries => {
-                                        let reply = Packet {
-                                            message_type: AppendEntriesAck,
-                                            term: self.term.load(Ordering::Acquire),
-                                            peer: packet.peer,
-                                        };
+                                        let reply = self.handle_append(packet).await;
                                         outgoing.send(reply).await.unwrap(); // TODO
-                                    },
-                                    VoteRequest { last_log_index, last_log_term } => {
+},
+                                    VoteRequest { .. } => {
                                         let mut current_term = self.term.load(Ordering::Acquire);
                                         let vote_granted = if packet.term >= current_term {
                                             let mut last_vote = self.last_vote.lock().await;
@@ -242,20 +276,19 @@ impl Server {
                                             term: current_term,
                                             peer: packet.peer,
                                         };
+                                        info!(candidate = ?reply.peer, ?vote_granted, "casting vote");
                                         outgoing.send(reply).await.unwrap();
                                     },
-                                    _ => { unimplemented!("Invalid request type"); },
+                                    _ => { error!(state = ?server_state, ?packet, "unexpected packet"); },
                                 }
                             },
                         },
 
                         // timer that goes off when leader timed out
                         _ = sleep(interval) => {
-                            tracing::info!("Leader timeout, waited {:?}", interval);
-                            tracing::warn!("Leader timeout, would start an election here");
-                            self.state.store(ServerState::Candidate, Ordering::Relaxed);
-                            self.term.fetch_add(1, Ordering::Acquire);
-                            self.reset_election_results().await;
+                            info!("Leader timeout after {:?}; becoming candidate", interval);
+                            self.state.store(ServerState::Candidate, Ordering::Release);
+                            self.start_election().await;
                         }
                     }
                 }
@@ -268,6 +301,7 @@ impl Server {
         let server = Arc::new(Self {
             peers: RwLock::new(peers),
             state: AtomicServerState::new(ServerState::Follower),
+            // state_span: RwLock::new(None),
             term: AtomicU64::new(0),
             last_vote: Mutex::new(None),
             election_results: Mutex::new(HashMap::new()),
@@ -282,16 +316,17 @@ impl Server {
 
         {
             let mut tasks = server.tasks.try_lock().expect("should be exclusive at this point");
-            tasks.spawn(Self::connection_loop(connection, packets_receive_tx, packets_send_rx));
+            tasks.spawn(Self::connection_loop(connection, packets_receive_tx, packets_send_rx).in_current_span());
             
-            tasks.spawn(Arc::clone(&server).send_heartbeat_loop(packets_send_tx.clone()));
-            tasks.spawn(Arc::clone(&server).incoming_packet_loop(packets_receive_rx, packets_send_tx));
+            tasks.spawn(Arc::clone(&server).send_heartbeat_loop(packets_send_tx.clone()).in_current_span());
+            tasks.spawn(Arc::clone(&server).incoming_packet_loop(packets_receive_rx, packets_send_tx).in_current_span());
         }
 
-        tracing::info!("Starting Server");
+        info!("Starting Server");
         Ok(server)
     }
 
+    #[instrument]
     async fn run(&self) -> Result<(), ConnectionError> {
         let mut tasks = self.tasks.try_lock().expect("should be exclusive");
         while let Some(res) = tasks.join_next().await {
@@ -315,7 +350,7 @@ async fn main() {
         .from_env_lossy();
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_tree::HierarchicalLayer::new(2))
+        .with(tracing_forest::ForestLayer::default())
         .init();
 
     let opts = Config::parse();
