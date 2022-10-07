@@ -40,4 +40,8 @@ impl Connection for UdpConnection {
         packet.peer = peer_addr.into();
         Ok(packet)
     }
+
+    fn address(&self) -> ServerAddress {
+        self.socket.local_addr().expect("should always be bound").into()
+    }
 }

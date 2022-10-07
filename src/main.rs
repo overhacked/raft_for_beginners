@@ -10,28 +10,28 @@ use clap::Parser;
 use tokio::sync::{Mutex, RwLock};
 use tokio::sync::mpsc::{Sender, Receiver};
 use tokio::task::JoinSet;
-use tokio::time::sleep;
+use tokio::time::{sleep, sleep_until, Instant};
 // use tracing::span::EnteredSpan;
-use tracing::{trace, info, error, instrument, Instrument};
+use tracing::{trace, info, warn, error, info_span, instrument, Instrument};
 use k9::{assert_greater_than, assert_lesser_than};
 use rand::Rng;
-use atomic_enum::atomic_enum;
 
 use crate::config::Config;
 use crate::connection::{Connection, ConnectionError, udp::UdpConnection, ServerAddress, Packet, PacketType::*};
 
-#[atomic_enum]
-#[derive(PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum ServerState {
-    Follower = 0,
-    Candidate,
+    Follower,
+    Candidate {
+        election_ends_at: Instant,
+    },
     Leader,
 }
 
 #[derive(Debug)]
 struct Server {
     peers: RwLock<Vec<ServerAddress>>,
-    state: AtomicServerState,
+    state: RwLock<ServerState>,
     // state_span: RwLock<Option<EnteredSpan>>,
     election_results: Mutex<HashMap<ServerAddress, bool>>,
     last_vote: Mutex<Option<ServerAddress>>,
@@ -58,7 +58,9 @@ impl Server {
         Duration::from_millis(self.heartbeat_millis.load(Ordering::Relaxed))
     }
 
-    fn get_current_timeout(&self) -> Duration {
+    /// get the timeout for a term; either when an election times out,
+    /// or timeout for followers not hearing from the leader
+    fn get_term_timeout(&self) -> Duration {
         let min = self.election_timeout_min.load(Ordering::Relaxed);
         let max = self.election_timeout_max.load(Ordering::Relaxed);
         // https://stackoverflow.com/questions/19671845/how-can-i-generate-a-random-number-within-a-range-in-rust
@@ -67,19 +69,35 @@ impl Server {
     }
 
     async fn start_election(&self) {
+        // Increment the term
         self.term.fetch_add(1, Ordering::Acquire);
+        let current_term = self.term.load(Ordering::Acquire);
+        info!(term = ?current_term, "beginning election");
+
+        // (Re)set the state to Candidate and establish a new timeout
+        let mut state_mut = self.state.write().await;
+        *state_mut = ServerState::Candidate {
+            election_ends_at: Instant::now() + self.get_term_timeout(),
+        };
+
+        // Reset the election results
         let mut election_results = self.election_results.lock().await;
         let peers = self.peers.read().await;
         *election_results = peers.iter().cloned().zip(iter::repeat(false)).collect();
     }
 
-    async fn handle_append(&self, packet: Packet) -> Packet {
+    async fn handle_append(&self, packet: &Packet) -> Packet {
         // TODO: actually handle the append
-        let ack = packet.term >= self.term.load(Ordering::Acquire);
+        let current_term = self.term.load(Ordering::Acquire);
+        let ack = packet.term >= current_term;
+        if packet.term > current_term {
+            self.term.compare_exchange(current_term, packet.term, Ordering::Acquire, Ordering::Acquire)
+                .expect("handle concurrency error");
+        }
         Packet {
             message_type: AppendEntriesAck { did_append: ack },
             term: self.term.load(Ordering::Acquire),
-            peer: packet.peer,
+            peer: packet.peer.clone(),
         }
     }
 
@@ -109,7 +127,8 @@ impl Server {
             // TODO: make this less bad
             let instant = interval.tick().await;
 
-            match self.state.load(Ordering::Relaxed) {
+            let state = (*self.state.read().await).clone();
+            match state {
                 // 1. we are leader
                 ServerState::Leader => {
                     // send send heart beat to peers
@@ -130,7 +149,7 @@ impl Server {
                     }
                 },
                 // 2. we are candidate  
-                ServerState::Candidate => {
+                ServerState::Candidate { election_ends_at } => {
                         // increment term
                         // send out request for votes
                         // timeout if we don't get enough votes
@@ -144,6 +163,8 @@ impl Server {
                         };
                         outgoing.send(peer_request).await.unwrap(); // TODO
                     }
+
+                    sleep_until(election_ends_at).await;
                 },
                 ServerState::Follower => {
                     // 3. we are follower
@@ -157,7 +178,7 @@ impl Server {
     async fn incoming_packet_loop(self: Arc<Self>, mut incoming: Receiver<Packet>, outgoing: Sender<Packet>) -> Result<(), ConnectionError> {
         loop {
 
-            let server_state = self.state.load(Ordering::Relaxed);
+            let server_state = (*self.state.read().await).clone();
             match server_state {
                 ServerState::Leader => {
                     // 1. we are leader
@@ -165,11 +186,10 @@ impl Server {
                     // TODO: read and discard packets off the wire
                     let _discard = incoming.recv().await.ok_or(ConnectionError)?;
                 },
-                ServerState::Candidate => {
+                ServerState::Candidate { election_ends_at } => {
                     // 2. we are candidate
                         // if we find a valid leader, become follower
                         // become leader if we get majority of votes
-                    let interval = self.get_current_timeout();
                     tokio::select! {
                         received = incoming.recv() => match received {
                             None => return Ok(()),
@@ -177,30 +197,36 @@ impl Server {
                                 // TODO: make this less naive
                                 match packet.message_type {
                                     AppendEntries => {
-                                        let reply = self.handle_append(packet).await;
+                                        let reply = self.handle_append(&packet).await;
                                         if let Packet { message_type: AppendEntriesAck { did_append: true }, .. } = reply {
-                                            info!("got valid leader packet; becoming follower");
-                                            self.state.store(ServerState::Follower, Ordering::Release);
+                                            info!(peer = ?packet.peer, "got valid leader packet; becoming follower");
+                                            let mut state_mut = self.state.write().await;
+                                            *state_mut = ServerState::Follower;
+                                        } else {
+                                            warn!(peer = ?packet.peer, "got invalid leader packet; ignoring");
                                         }
                                         outgoing.send(reply).await.unwrap(); // TODO
                                     },
                                     VoteResponse { is_granted } => {
-                                        info!("Got a vote response");
+                                        let current_term = self.term.load(Ordering::Acquire);
+                                        info!(peer = ?packet.peer, term = ?packet.term, is_granted, "got a vote response");
 
                                         let mut election_results = self.election_results.lock().await;
 
                                         // store the result from the vote
                                         election_results.insert(packet.peer, is_granted);
 
-                                        // count votes and peers
-                                        let vote_cnt = election_results.values().filter(|v| **v).count();
-                                        let peer_cnt = self.peers.read().await.len();
-                                        info!(?vote_cnt, ?peer_cnt, "vote count, peer count");
+                                        // count votes and nodes
+                                        // add 1 to each so we count ourselves
+                                        let vote_cnt = election_results.values().filter(|v| **v).count() + 1;
+                                        let node_cnt = self.peers.read().await.len() + 1;
+                                        info!(?vote_cnt, ?node_cnt, "vote count, node count");
 
-                                        // did we get more than half the votes?
-                                        if vote_cnt > peer_cnt / 2 {
-                                            info!(votes = %vote_cnt, "won election; becoming Leader");
-                                            self.state.store(ServerState::Leader, Ordering::Release);
+                                        // did we get more than half the votes, including our own?
+                                        if vote_cnt > node_cnt / 2 {
+                                            info!(votes = %vote_cnt, term = ?current_term, "won election; becoming Leader");
+                                            let mut state_mut = self.state.write().await;
+                                            *state_mut = ServerState::Leader;
                                         }
                                     },
                                     _ => {
@@ -212,11 +238,8 @@ impl Server {
                     
                         // timer that goes off when election timed out
                         // TODO: doesn't work
-                        _ = sleep(interval) => {
-                            info!("Election timeout, waited {:?}", interval);
-
-                            // is this the best way to "restart" the election?
-                            tracing::warn!("Election timeout, restarting election");
+                        _ = sleep_until(election_ends_at) => {
+                            info!("Election timeout; restarting election");
                             self.start_election().await
                         }
 
@@ -228,7 +251,7 @@ impl Server {
                         // if we timeout, become candidate
                         // send vote if valid vote request
 
-                    let interval = self.get_current_timeout();
+                    let interval = self.get_term_timeout();
                     tokio::select! {
                         // process heartbeats from leader
                         received = incoming.recv() => match received {
@@ -237,9 +260,9 @@ impl Server {
                                 // TODO: make this less naive
                                 match packet.message_type {
                                     AppendEntries => {
-                                        let reply = self.handle_append(packet).await;
+                                        let reply = self.handle_append(&packet).await;
                                         outgoing.send(reply).await.unwrap(); // TODO
-},
+                                    },
                                     VoteRequest { .. } => {
                                         let mut current_term = self.term.load(Ordering::Acquire);
                                         let vote_granted = if packet.term >= current_term {
@@ -247,7 +270,8 @@ impl Server {
 
                                             if packet.term > current_term {
                                                 // the term in the packet is newer, so update, and also clear any existing vote...
-                                                current_term = self.term.compare_exchange(current_term, packet.term, Ordering::Acquire, Ordering::Acquire).expect("Handle concurrency failure");
+                                                self.term.compare_exchange(current_term, packet.term, Ordering::Acquire, Ordering::Acquire).expect("Handle concurrency failure");
+                                                current_term = packet.term;
                                                 *last_vote = None;
                                             }
 
@@ -276,7 +300,7 @@ impl Server {
                                             term: current_term,
                                             peer: packet.peer,
                                         };
-                                        info!(candidate = ?reply.peer, ?vote_granted, "casting vote");
+                                        info!(candidate = ?reply.peer, term = ?reply.term, ?vote_granted, "casting vote");
                                         outgoing.send(reply).await.unwrap();
                                     },
                                     _ => { error!(state = ?server_state, ?packet, "unexpected packet"); },
@@ -287,7 +311,6 @@ impl Server {
                         // timer that goes off when leader timed out
                         _ = sleep(interval) => {
                             info!("Leader timeout after {:?}; becoming candidate", interval);
-                            self.state.store(ServerState::Candidate, Ordering::Release);
                             self.start_election().await;
                         }
                     }
@@ -300,7 +323,7 @@ impl Server {
     {
         let server = Arc::new(Self {
             peers: RwLock::new(peers),
-            state: AtomicServerState::new(ServerState::Follower),
+            state: RwLock::new(ServerState::Follower),
             // state_span: RwLock::new(None),
             term: AtomicU64::new(0),
             last_vote: Mutex::new(None),
@@ -315,11 +338,12 @@ impl Server {
         let (packets_send_tx, packets_send_rx) = tokio::sync::mpsc::channel(32);
 
         {
+            let run_span = info_span!("server", address = ?connection.address());
             let mut tasks = server.tasks.try_lock().expect("should be exclusive at this point");
-            tasks.spawn(Self::connection_loop(connection, packets_receive_tx, packets_send_rx).in_current_span());
+            tasks.spawn(Self::connection_loop(connection, packets_receive_tx, packets_send_rx).instrument(run_span));
             
-            tasks.spawn(Arc::clone(&server).send_heartbeat_loop(packets_send_tx.clone()).in_current_span());
-            tasks.spawn(Arc::clone(&server).incoming_packet_loop(packets_receive_rx, packets_send_tx).in_current_span());
+            tasks.spawn(Arc::clone(&server).send_heartbeat_loop(packets_send_tx.clone()));
+            tasks.spawn(Arc::clone(&server).incoming_packet_loop(packets_receive_rx, packets_send_tx));
         }
 
         info!("Starting Server");
