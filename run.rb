@@ -1,6 +1,6 @@
 puts "cargo build --release --quiet"
 
-log_level = "info"
+log_level = ENV.fetch('RUST_LOG', "info")
 peers = %w{8000 8001 8002}
 
 (0..(peers.size - 1)).each do
