@@ -34,6 +34,7 @@ impl Connection for UdpConnection {
         buf.truncate(bytes_received);
         trace!(?peer_addr, bytes_received, "receive"); // DEBUG
 
+        tracing::warn!(?buf, "TODO: deserialize packet");
         let packet = postcard::from_bytes(&buf).expect("deserialization failed");
         Ok(packet)
     }

@@ -84,11 +84,10 @@ impl Server {
             // TODO: make this less bad
             let instant = interval.tick().await;
 
-
             match self.state.load(Ordering::Relaxed) {
+                // 1. we are leader
                 ServerState::Leader => {
-                    // 1. we are leader
-                        // send send heart beat?
+                    // send send heart beat to peers
                     let peers = self.peers.read().await;
                     for peer in peers.iter() {
                         let peer_request = Packet {
@@ -96,15 +95,17 @@ impl Server {
                             term: self.term.load(Ordering::Acquire),
                             peer: peer.to_owned(),
                         };
-                        outgoing.send(peer_request).await.unwrap(); // TODO
+                        outgoing.send(peer_request).await.unwrap();
+
+                        // see if we should be updating the interval, incase the config change somehow
                         let new_interval= self.get_current_duration();
                         if new_interval != current_interval {
                             interval = tokio::time::interval_at(instant + new_interval, new_interval);
                         }
                     }
                 },
+                // 2. we are candidate  
                 ServerState::Candidate => {
-                    // 2. we are candidate  
                         // increment term
                         // send out request for votes
                         // timeout if we don't get enough votes
@@ -140,8 +141,48 @@ impl Server {
                     // 2. we are candidate
                         // if we find a valid leader, become follower
                         // become leader if we get majority of votes
-                    tracing::warn!("We would do some candidate stuff here");
-                    std::process::exit(1);
+                    let interval = self.get_current_timeout();
+                    tokio::select! {
+                        received = incoming.recv() => match received {
+                            None => return Ok(()),
+                            Some(packet) => {
+                                // TODO: make this less naive
+                                match packet.message_type {
+                                    VoteResponse { is_granted } => {
+                                        tracing::info!("Got a vote response");
+
+                                        let mut election_results = self.election_results.lock().await;
+
+                                        // store the result from the vote
+                                        election_results.insert(packet.peer, is_granted);
+
+                                        // count votes and peers
+                                        let vote_cnt = election_results.values().filter(|v| **v).count();
+                                        let peer_cnt = self.peers.read().await.len();
+                                        tracing::info!(?vote_cnt, ?peer_cnt, "vote count, peer count");
+
+                                        // did we get more than half the votes?
+                                        if vote_cnt > peer_cnt / 2 {
+                                            self.state.store(ServerState::Leader, Ordering::Release);
+                                        }
+                                    },
+                                    _ => {
+                                        // do nothing with other packets, as we wait for timeout of the election
+                                    },
+                                }
+                            }
+                        },
+                    
+                        // timer that goes off when election timed out
+                        _ = sleep(interval) => {
+                            tracing::info!("Election timeout, waited {:?}", interval);
+
+                            // is this the best way to "restart" the election?
+                            tracing::warn!("Election timeout, restarting election by going back to follower");
+                            self.state.store(ServerState::Follower, Ordering::Relaxed);
+                        }
+
+                    }
                 },
                 ServerState::Follower => {
                     // 3. we are follower
