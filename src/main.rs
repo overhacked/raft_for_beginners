@@ -12,7 +12,7 @@ use tokio::sync::mpsc::{Sender, Receiver};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, sleep_until, Instant};
 // use tracing::span::EnteredSpan;
-use tracing::{trace, info, warn, error, info_span, instrument, Instrument};
+use tracing::{trace, debug, info, warn, error};
 use k9::{assert_greater_than, assert_lesser_than};
 use rand::Rng;
 
@@ -68,10 +68,26 @@ impl Server {
         Duration::from_millis(timeout)
     }
 
+    async fn reset_vote(&self) {
+        let mut vote = self.last_vote.lock().await;
+        *vote = None;
+    }
+
+    async fn increment_term(&self) -> u64 {
+        self.term.fetch_add(1, Ordering::Acquire);
+        self.reset_vote().await;
+        self.term.load(Ordering::Acquire)
+    }
+
+    async fn set_term(&self, new_term: u64) -> u64 {
+        self.term.store(new_term, Ordering::Release);
+        self.reset_vote().await;
+        self.term.load(Ordering::Acquire)
+    }
+
     async fn start_election(&self) {
         // Increment the term
-        self.term.fetch_add(1, Ordering::Acquire);
-        let current_term = self.term.load(Ordering::Acquire);
+        let current_term = self.increment_term().await;
         info!(term = ?current_term, "beginning election");
 
         // (Re)set the state to Candidate and establish a new timeout
@@ -88,19 +104,79 @@ impl Server {
 
     async fn handle_append(&self, packet: &Packet) -> Packet {
         // TODO: actually handle the append
-        let current_term = self.term.load(Ordering::Acquire);
+        let mut current_term = self.term.load(Ordering::Acquire);
         let ack = packet.term >= current_term;
-        if packet.term > current_term {
-            self.term.compare_exchange(current_term, packet.term, Ordering::Acquire, Ordering::Acquire)
-                .expect("handle concurrency error");
+        if ack {
+            if packet.term > current_term {
+                info!(peer = ?packet.peer, term = ?packet.term, "got valid leader packet; becoming follower");
+                let mut state_mut = self.state.write().await;
+                *state_mut = ServerState::Follower;
+
+                current_term = self.set_term(packet.term).await;
+            }
+        } else {
+            warn!(peer = ?packet.peer, term = ?packet.term, "got invalid leader packet; ignoring");
         }
+
         Packet {
             message_type: AppendEntriesAck { did_append: ack },
-            term: self.term.load(Ordering::Acquire),
+            term: current_term,
             peer: packet.peer.clone(),
         }
     }
 
+    /// Handle VoteRequest packets
+    async fn handle_voterequest(&self, packet: &Packet) -> Packet {
+        let mut current_term = self.term.load(Ordering::Acquire);
+        let vote_granted = if packet.term >= current_term {
+            if packet.term > current_term {
+                // the term in the packet is newer, so update which will also clear any existing vote...
+                current_term = self.set_term(packet.term).await;
+            }
+
+            let mut last_vote = self.last_vote.lock().await;
+            match &*last_vote {
+                None => { 
+                    // We didn't vote... --> true vote
+                    *last_vote = Some(packet.peer.clone());
+                    true
+                },
+                Some(p) if p == &packet.peer => {
+                    // or we voted for this peer already --> true vote
+                    // TODO: Is packet last_log_index last_log_term as up to date as our log?
+                    true
+                },
+                Some(_) => {
+                    // We already voted, and it wasn't for this peer --> False vote
+                    false
+                }
+            }
+        } else {
+            // Packet term is too old
+            false
+        };
+        
+        let reply = Packet {
+            message_type: VoteResponse { is_granted: vote_granted },
+            term: current_term,
+            peer: packet.peer.clone(),
+        };
+        info!(candidate = ?reply.peer, term = ?reply.term, ?vote_granted, "casting vote");
+        reply
+    }
+
+    /// Handle signals
+    async fn signal_handler(self: Arc<Self>) -> Result<(), ConnectionError> {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut usr1_stream = signal(SignalKind::user_defined1()).expect("signal handling failed");
+
+        loop {
+            usr1_stream.recv().await;
+            let state = (*self.state.read().await).clone();
+            info!(?state, "SIGUSR1");
+        }
+    }
     /// Get and send packets!
     async fn connection_loop(connection: impl Connection, incoming: Sender<Packet>, mut outgoing: Receiver<Packet>) -> Result<(), ConnectionError> {
         loop {
@@ -108,7 +184,8 @@ impl Server {
                 packet = connection.receive() => {
                     let packet = packet?;
                     trace!(?packet, "receive");
-                    incoming.try_send(packet).expect("TODO: ConnectionError");
+                    //incoming.try_send(packet).expect("TODO: ConnectionError");
+                    let _ = incoming.send(packet).await; // DEBUG: try ignoring send errors
                 },
                 Some(packet) = outgoing.recv() => {
                     trace!(?packet, "send");
@@ -184,7 +261,21 @@ impl Server {
                     // 1. we are leader
                         // nothing for now
                     // TODO: read and discard packets off the wire
-                    let _discard = incoming.recv().await.ok_or(ConnectionError)?;
+                    let packet = incoming.recv().await.ok_or(ConnectionError)?;
+                    match packet.message_type {
+                        AppendEntries => {
+                            let reply = self.handle_append(&packet).await;
+                            outgoing.send(reply).await.unwrap(); // TODO
+                        },
+                        AppendEntriesAck { .. } => {
+                            // TODO: commit in log
+                        },
+                        VoteRequest { .. } => {
+                            let reply = self.handle_voterequest(&packet).await;
+                            outgoing.send(reply).await.unwrap(); // TODO
+                        },
+                        _ => { error!(state = ?server_state, ?packet, "unexpected packet"); },
+                    }
                 },
                 ServerState::Candidate { election_ends_at } => {
                     // 2. we are candidate
@@ -198,13 +289,6 @@ impl Server {
                                 match packet.message_type {
                                     AppendEntries => {
                                         let reply = self.handle_append(&packet).await;
-                                        if let Packet { message_type: AppendEntriesAck { did_append: true }, .. } = reply {
-                                            info!(peer = ?packet.peer, "got valid leader packet; becoming follower");
-                                            let mut state_mut = self.state.write().await;
-                                            *state_mut = ServerState::Follower;
-                                        } else {
-                                            warn!(peer = ?packet.peer, "got invalid leader packet; ignoring");
-                                        }
                                         outgoing.send(reply).await.unwrap(); // TODO
                                     },
                                     VoteResponse { is_granted } => {
@@ -264,44 +348,8 @@ impl Server {
                                         outgoing.send(reply).await.unwrap(); // TODO
                                     },
                                     VoteRequest { .. } => {
-                                        let mut current_term = self.term.load(Ordering::Acquire);
-                                        let vote_granted = if packet.term >= current_term {
-                                            let mut last_vote = self.last_vote.lock().await;
-
-                                            if packet.term > current_term {
-                                                // the term in the packet is newer, so update, and also clear any existing vote...
-                                                self.term.compare_exchange(current_term, packet.term, Ordering::Acquire, Ordering::Acquire).expect("Handle concurrency failure");
-                                                current_term = packet.term;
-                                                *last_vote = None;
-                                            }
-
-                                            match &*last_vote {
-                                                None => { 
-                                                    // We didn't vote... --> true vote
-                                                    true
-                                                },
-                                                Some(p) if p == &packet.peer => {
-                                                    // or we voted for this peer already --> true vote
-                                                    // TODO: Is packet last_log_index last_log_term as up to date as our log?
-                                                    true
-                                                },
-                                                Some(_) => {
-                                                    // We already voted, and it wasn't for this peer --> False vote
-                                                    false
-                                                }
-                                            }
-                                        } else {
-                                            // Packet term is too old
-                                            false
-                                        };
-                                        
-                                        let reply = Packet {
-                                            message_type: VoteResponse { is_granted: vote_granted },
-                                            term: current_term,
-                                            peer: packet.peer,
-                                        };
-                                        info!(candidate = ?reply.peer, term = ?reply.term, ?vote_granted, "casting vote");
-                                        outgoing.send(reply).await.unwrap();
+                                        let reply = self.handle_voterequest(&packet).await;
+                                        outgoing.send(reply).await.unwrap(); // TODO
                                     },
                                     _ => { error!(state = ?server_state, ?packet, "unexpected packet"); },
                                 }
@@ -338,9 +386,10 @@ impl Server {
         let (packets_send_tx, packets_send_rx) = tokio::sync::mpsc::channel(32);
 
         {
-            let run_span = info_span!("server", address = ?connection.address());
+            //let run_span = info_span!("server", address = ?connection.address());
             let mut tasks = server.tasks.try_lock().expect("should be exclusive at this point");
-            tasks.spawn(Self::connection_loop(connection, packets_receive_tx, packets_send_rx).instrument(run_span));
+            tasks.spawn(Arc::clone(&server).signal_handler());
+            tasks.spawn(Self::connection_loop(connection, packets_receive_tx, packets_send_rx));
             
             tasks.spawn(Arc::clone(&server).send_heartbeat_loop(packets_send_tx.clone()));
             tasks.spawn(Arc::clone(&server).incoming_packet_loop(packets_receive_rx, packets_send_tx));
@@ -350,12 +399,12 @@ impl Server {
         Ok(server)
     }
 
-    #[instrument]
     async fn run(&self) -> Result<(), ConnectionError> {
         let mut tasks = self.tasks.try_lock().expect("should be exclusive");
         while let Some(res) = tasks.join_next().await {
             let task_res = res.expect("Task Panicked");
             task_res?;
+            debug!("Task Exited");
         }
         Ok(())
     }
