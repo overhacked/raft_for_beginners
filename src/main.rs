@@ -7,10 +7,11 @@ use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
 use std::time::Duration;
 
 use clap::Parser;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio::sync::mpsc::{Sender, Receiver};
 use tokio::task::JoinSet;
-use tokio::time::{sleep_until, Instant};
+use tokio::time::{sleep, sleep_until, Instant};
 // use tracing::span::EnteredSpan;
 use tracing::{trace, debug, info, warn};
 use k9::{assert_greater_than, assert_lesser_than};
@@ -28,6 +29,7 @@ enum ServerState {
 
 #[derive(Debug)]
 struct Server {
+    address: ServerAddress,
     peers: RwLock<Vec<ServerAddress>>,
     state: RwLock<ServerState>,
     // state_span: RwLock<Option<EnteredSpan>>,
@@ -106,6 +108,8 @@ impl Server {
         let mut election_results = self.election_results.lock().await;
         let peers = self.peers.read().await;
         *election_results = peers.iter().cloned().zip(iter::repeat(false)).collect();
+        let mut voted_for = self.last_vote.lock().await;
+        *voted_for = Some(self.address.clone());
 
         // Reset the timeout
         self.reset_term_timeout().await;
@@ -116,7 +120,12 @@ impl Server {
         let current_term = self.term.load(Ordering::Acquire);
         let ack = packet.term == current_term;
 
-        match *self.state.read().await {
+        if ack {
+            self.reset_term_timeout().await;
+        }
+
+        let state = (*self.state.read().await).clone();
+        match state {
             ServerState::Leader => {
                 return None; // Drop any AppendEntries if leader
             },
@@ -205,9 +214,13 @@ impl Server {
 
         // did we get more than half the votes, including our own?
         if vote_cnt > node_cnt / 2 {
-            info!(votes = %vote_cnt, term = ?self.term.load(Ordering::Acquire), "won election; becoming Leader");
             let mut state_mut = self.state.write().await;
-            *state_mut = ServerState::Leader;
+            if let ServerState::Candidate = *state_mut {
+                info!(votes = %vote_cnt, term = ?self.term.load(Ordering::Acquire), "won election; becoming Leader");
+                *state_mut = ServerState::Leader;
+            } else {
+                debug!("got vote in already-won election");
+            }
         }
     }
 
@@ -216,11 +229,22 @@ impl Server {
         use tokio::signal::unix::{signal, SignalKind};
 
         let mut usr1_stream = signal(SignalKind::user_defined1()).expect("signal handling failed");
+        let mut stdout = tokio::io::stdout();
 
         loop {
-            usr1_stream.recv().await;
-            let state = (*self.state.read().await).clone();
-            info!(?state, "SIGUSR1");
+            tokio::select! {
+                _ = usr1_stream.recv() => {
+                    let state = (*self.state.read().await).clone();
+                    info!(?state, "SIGUSR1");
+                },
+                _ = sleep(Duration::from_secs(1)) => {
+                    let server_state = self.state.read().await;
+                    let state_string = format!("\x1Bk{:?}\x1B", *server_state);
+                    // println!("\x1Bk{:?}\x1B", *server_state);
+                    let _yeet = stdout.write_all(state_string.as_bytes()).await;
+                    let _yeet = stdout.flush().await;
+                }
+            }
         }
     }
     /// Get and send packets!
@@ -234,7 +258,6 @@ impl Server {
                     let _ = incoming.send(packet).await; // DEBUG: try ignoring send errors
                 },
                 Some(packet) = outgoing.recv() => {
-                    trace!(?packet, "send");
                     connection.send(packet).await?;
                 },
             }
@@ -287,8 +310,21 @@ impl Server {
                         outgoing.send(peer_request).await.unwrap(); // TODO
                     }
 
-                    let next_timeout = *self.term_timeout.read().await;
-                    sleep_until(next_timeout).await;
+                    let election_timeout = (*self.term_timeout.read().await).clone();
+                    loop {
+                        let now = interval.tick().await;
+                        match *self.state.read().await {
+                            ServerState::Candidate => {
+                                if now >= election_timeout {
+                                    info!("Election timeout; restarting election");
+                                    self.start_election().await;
+                                    break;
+                                }
+                            },
+                            _ => { break; },
+                        }
+
+                    }
                 },
                 ServerState::Follower => {
                     // 3. we are follower
@@ -339,6 +375,7 @@ impl Server {
         let election_timeout_max = election_timeout_max.as_millis() as u64;
         let term_timeout = Self::generate_random_timeout(election_timeout_min, election_timeout_max);
         let server = Arc::new(Self {
+            address: connection.address(),
             peers: RwLock::new(peers),
             state: RwLock::new(ServerState::Follower),
             // state_span: RwLock::new(None),
