@@ -29,17 +29,12 @@ enum ServerState {
 
 #[derive(Debug)]
 struct Server {
-    address: ServerAddress,
-    peers: RwLock<Vec<ServerAddress>>,
+    config: Config,
     state: RwLock<ServerState>,
-    // state_span: RwLock<Option<EnteredSpan>>,
     election_results: Mutex<HashMap<ServerAddress, bool>>,
     last_vote: Mutex<Option<ServerAddress>>,
     term: AtomicU64,
     term_timeout: RwLock<Instant>,
-    heartbeat_millis: AtomicU64,
-    election_timeout_min: AtomicU64,
-    election_timeout_max: AtomicU64,
     tasks: Mutex<JoinSet<Result<(), ConnectionError>>>,
 }
 
@@ -56,7 +51,7 @@ impl Server {
     */
 
     fn get_current_duration(&self) -> Duration {
-        Duration::from_millis(self.heartbeat_millis.load(Ordering::Relaxed))
+        self.config.heartbeat_interval
     }
 
     async fn update_term(&self, packet: &Packet) -> u64 {
@@ -69,7 +64,9 @@ impl Server {
         packet.term
     }
 
-    fn generate_random_timeout(min: u64, max: u64) -> Instant {
+    fn generate_random_timeout(min: Duration, max: Duration) -> Instant {
+        let min = min.as_millis() as u64;
+        let max = max.as_millis() as u64;
         let new_timeout_millis = rand::thread_rng().gen_range(min..max);
         Instant::now() + Duration::from_millis(new_timeout_millis)
     }
@@ -77,11 +74,9 @@ impl Server {
     /// get the timeout for a term; either when an election times out,
     /// or timeout for followers not hearing from the leader
     async fn reset_term_timeout(&self) {
-        let min = self.election_timeout_min.load(Ordering::Relaxed);
-        let max = self.election_timeout_max.load(Ordering::Relaxed);
         // https://stackoverflow.com/questions/19671845/how-can-i-generate-a-random-number-within-a-range-in-rust
         let mut timeout_mut = self.term_timeout.write().await;
-        *timeout_mut = Self::generate_random_timeout(min, max);
+        *timeout_mut = Self::generate_random_timeout(self.config.election_timeout_min, self.config.election_timeout_max);
     }
 
     async fn reset_vote(&self) {
@@ -106,10 +101,9 @@ impl Server {
 
         // Reset the election results
         let mut election_results = self.election_results.lock().await;
-        let peers = self.peers.read().await;
-        *election_results = peers.iter().cloned().zip(iter::repeat(false)).collect();
+        *election_results = self.config.peers.iter().cloned().zip(iter::repeat(false)).collect();
         let mut voted_for = self.last_vote.lock().await;
-        *voted_for = Some(self.address.clone());
+        *voted_for = Some(self.config.listen_socket.clone());
 
         // Reset the timeout
         self.reset_term_timeout().await;
@@ -209,7 +203,7 @@ impl Server {
         // count votes and nodes
         // add 1 to each so we count ourselves
         let vote_cnt = election_results.values().filter(|v| **v).count() + 1;
-        let node_cnt = self.peers.read().await.len() + 1;
+        let node_cnt = self.config.peers.len() + 1;
         info!(?vote_cnt, ?node_cnt, "vote count, node count");
 
         // did we get more than half the votes, including our own?
@@ -278,8 +272,7 @@ impl Server {
                 // 1. we are leader
                 ServerState::Leader => {
                     // send send heart beat to peers
-                    let peers = self.peers.read().await;
-                    for peer in peers.iter() {
+                    for peer in self.config.peers.iter() {
                         let peer_request = Packet {
                             message_type: AppendEntries,
                             term: self.term.load(Ordering::Acquire),
@@ -299,8 +292,7 @@ impl Server {
                         // increment term
                         // send out request for votes
                         // timeout if we don't get enough votes
-                    let peers = self.peers.read().await;
-                    for peer in peers.iter() {
+                    for peer in self.config.peers.iter() {
                         let current_term = self.term.load(Ordering::Acquire);
                         let peer_request = Packet {
                             message_type: VoteRequest { last_log_index: 0, last_log_term: current_term - 1 }, // TODO: THIS IS THE WRONG TERM, it should come from the log and doesn't need the -1
@@ -369,23 +361,16 @@ impl Server {
         } 
     }
 
-    pub fn start(connection: impl Connection, peers: Vec<ServerAddress>, heartbeat_interval: Duration, election_timeout_min: Duration, election_timeout_max: Duration) -> Result<Arc<Self>, ConnectionError>
+    pub fn start(connection: impl Connection, config: Config) -> Result<Arc<Self>, ConnectionError>
     {
-        let election_timeout_min = election_timeout_min.as_millis() as u64;
-        let election_timeout_max = election_timeout_max.as_millis() as u64;
-        let term_timeout = Self::generate_random_timeout(election_timeout_min, election_timeout_max);
+        let term_timeout = Self::generate_random_timeout(config.election_timeout_min, config.election_timeout_max);
         let server = Arc::new(Self {
-            address: connection.address(),
-            peers: RwLock::new(peers),
+            config,
             state: RwLock::new(ServerState::Follower),
-            // state_span: RwLock::new(None),
             term: AtomicU64::new(0),
             term_timeout: RwLock::new(term_timeout),
             last_vote: Mutex::new(None),
             election_results: Mutex::new(HashMap::new()),
-            heartbeat_millis: AtomicU64::new(heartbeat_interval.as_millis() as u64),
-            election_timeout_min: AtomicU64::new(election_timeout_min),
-            election_timeout_max: AtomicU64::new(election_timeout_max),
             tasks: Mutex::new(JoinSet::default()),
         });
 
@@ -440,7 +425,7 @@ async fn main() {
     assert_lesser_than!(opts.heartbeat_interval, opts.election_timeout_min);
     assert_lesser_than!(opts.election_timeout_min, opts.election_timeout_max);
 
-    let connection = UdpConnection::bind(opts.listen_socket).await.unwrap();
-    let server = Server::start(connection, opts.peers, opts.heartbeat_interval, opts.election_timeout_min, opts.election_timeout_max).expect("could not start server");
+    let connection = UdpConnection::bind(opts.listen_socket.clone()).await.unwrap();
+    let server = Server::start(connection, opts).expect("could not start server");
     server.run().await.expect("server.run exited with error");
 }
