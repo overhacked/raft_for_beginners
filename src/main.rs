@@ -10,9 +10,9 @@ use clap::Parser;
 use tokio::sync::{Mutex, RwLock};
 use tokio::sync::mpsc::{Sender, Receiver};
 use tokio::task::JoinSet;
-use tokio::time::{sleep, sleep_until, Instant};
+use tokio::time::{sleep_until, Instant};
 // use tracing::span::EnteredSpan;
-use tracing::{trace, debug, info, warn, error};
+use tracing::{trace, debug, info, warn};
 use k9::{assert_greater_than, assert_lesser_than};
 use rand::Rng;
 
@@ -22,9 +22,7 @@ use crate::connection::{Connection, ConnectionError, udp::UdpConnection, ServerA
 #[derive(Clone, Debug, PartialEq)]
 enum ServerState {
     Follower,
-    Candidate {
-        election_ends_at: Instant,
-    },
+    Candidate,
     Leader,
 }
 
@@ -36,6 +34,7 @@ struct Server {
     election_results: Mutex<HashMap<ServerAddress, bool>>,
     last_vote: Mutex<Option<ServerAddress>>,
     term: AtomicU64,
+    term_timeout: RwLock<Instant>,
     heartbeat_millis: AtomicU64,
     election_timeout_min: AtomicU64,
     election_timeout_max: AtomicU64,
@@ -58,14 +57,29 @@ impl Server {
         Duration::from_millis(self.heartbeat_millis.load(Ordering::Relaxed))
     }
 
+    async fn update_term(&self, packet: &Packet) -> u64 {
+        let current_term = self.term.load(Ordering::Acquire);
+        if packet.term > current_term {
+            self.term.store(packet.term, Ordering::Release);
+            *(self.state.write().await) = ServerState::Follower;
+            self.reset_vote().await;
+        }
+        packet.term
+    }
+
+    fn generate_random_timeout(min: u64, max: u64) -> Instant {
+        let new_timeout_millis = rand::thread_rng().gen_range(min..max);
+        Instant::now() + Duration::from_millis(new_timeout_millis)
+    }
+
     /// get the timeout for a term; either when an election times out,
     /// or timeout for followers not hearing from the leader
-    fn get_term_timeout(&self) -> Duration {
+    async fn reset_term_timeout(&self) {
         let min = self.election_timeout_min.load(Ordering::Relaxed);
         let max = self.election_timeout_max.load(Ordering::Relaxed);
         // https://stackoverflow.com/questions/19671845/how-can-i-generate-a-random-number-within-a-range-in-rust
-        let timeout = rand::thread_rng().gen_range(min..max);
-        Duration::from_millis(timeout)
+        let mut timeout_mut = self.term_timeout.write().await;
+        *timeout_mut = Self::generate_random_timeout(min, max);
     }
 
     async fn reset_vote(&self) {
@@ -79,12 +93,6 @@ impl Server {
         self.term.load(Ordering::Acquire)
     }
 
-    async fn set_term(&self, new_term: u64) -> u64 {
-        self.term.store(new_term, Ordering::Release);
-        self.reset_vote().await;
-        self.term.load(Ordering::Acquire)
-    }
-
     async fn start_election(&self) {
         // Increment the term
         let current_term = self.increment_term().await;
@@ -92,48 +100,56 @@ impl Server {
 
         // (Re)set the state to Candidate and establish a new timeout
         let mut state_mut = self.state.write().await;
-        *state_mut = ServerState::Candidate {
-            election_ends_at: Instant::now() + self.get_term_timeout(),
-        };
+        *state_mut = ServerState::Candidate;
 
         // Reset the election results
         let mut election_results = self.election_results.lock().await;
         let peers = self.peers.read().await;
         *election_results = peers.iter().cloned().zip(iter::repeat(false)).collect();
+
+        // Reset the timeout
+        self.reset_term_timeout().await;
     }
 
-    async fn handle_append(&self, packet: &Packet) -> Packet {
+    async fn handle_appendentries(&self, packet: &Packet) -> Option<Packet> {
         // TODO: actually handle the append
-        let mut current_term = self.term.load(Ordering::Acquire);
-        let ack = packet.term >= current_term;
-        if ack {
-            if packet.term > current_term {
+        let current_term = self.term.load(Ordering::Acquire);
+        let ack = packet.term == current_term;
+
+        match *self.state.read().await {
+            ServerState::Leader => {
+                return None; // Drop any AppendEntries if leader
+            },
+            ServerState::Candidate if ack => {
                 info!(peer = ?packet.peer, term = ?packet.term, "got valid leader packet; becoming follower");
                 let mut state_mut = self.state.write().await;
                 *state_mut = ServerState::Follower;
-
-                current_term = self.set_term(packet.term).await;
-            }
-        } else {
-            warn!(peer = ?packet.peer, term = ?packet.term, "got invalid leader packet; ignoring");
+                // TODO: append to log or wait for next AppendEntries?
+            },
+            ServerState::Follower if ack => {
+                // TODO: append to log
+            },
+            _ => {
+                // ack == false, continue to reply
+            },
         }
+        //else {
+        //    warn!(peer = ?packet.peer, term = ?packet.term, "got invalid leader packet; ignoring");
+        //}
 
-        Packet {
+        let reply = Packet {
             message_type: AppendEntriesAck { did_append: ack },
             term: current_term,
             peer: packet.peer.clone(),
-        }
+        };
+        Some(reply)
     }
 
     /// Handle VoteRequest packets
     async fn handle_voterequest(&self, packet: &Packet) -> Packet {
-        let mut current_term = self.term.load(Ordering::Acquire);
-        let vote_granted = if packet.term >= current_term {
-            if packet.term > current_term {
-                // the term in the packet is newer, so update which will also clear any existing vote...
-                current_term = self.set_term(packet.term).await;
-            }
-
+        let current_term = self.term.load(Ordering::Acquire);
+        let vote_granted = if packet.term == current_term {
+            self.reset_term_timeout().await;
             let mut last_vote = self.last_vote.lock().await;
             match &*last_vote {
                 None => { 
@@ -163,6 +179,36 @@ impl Server {
         };
         info!(candidate = ?reply.peer, term = ?reply.term, ?vote_granted, "casting vote");
         reply
+    }
+
+    /// Handle VoteResponse packets
+    async fn handle_voteresponse(&self, packet: &Packet) {
+        let current_term = self.term.load(Ordering::Acquire);
+        if packet.term != current_term {
+            warn!(peer = ?packet.peer, term = ?packet.term, "got a vote response for the wrong term");
+            return;
+        }
+
+        let is_granted = if let Packet { message_type: VoteResponse { is_granted }, .. } = packet { *is_granted } else { false };
+        info!(peer = ?packet.peer, term = ?packet.term, is_granted, "got a vote response");
+
+        let mut election_results = self.election_results.lock().await;
+
+        // store the result from the vote
+        election_results.insert(packet.peer.clone(), is_granted);
+
+        // count votes and nodes
+        // add 1 to each so we count ourselves
+        let vote_cnt = election_results.values().filter(|v| **v).count() + 1;
+        let node_cnt = self.peers.read().await.len() + 1;
+        info!(?vote_cnt, ?node_cnt, "vote count, node count");
+
+        // did we get more than half the votes, including our own?
+        if vote_cnt > node_cnt / 2 {
+            info!(votes = %vote_cnt, term = ?self.term.load(Ordering::Acquire), "won election; becoming Leader");
+            let mut state_mut = self.state.write().await;
+            *state_mut = ServerState::Leader;
+        }
     }
 
     /// Handle signals
@@ -226,7 +272,7 @@ impl Server {
                     }
                 },
                 // 2. we are candidate  
-                ServerState::Candidate { election_ends_at } => {
+                ServerState::Candidate => {
                         // increment term
                         // send out request for votes
                         // timeout if we don't get enough votes
@@ -241,7 +287,8 @@ impl Server {
                         outgoing.send(peer_request).await.unwrap(); // TODO
                     }
 
-                    sleep_until(election_ends_at).await;
+                    let next_timeout = *self.term_timeout.read().await;
+                    sleep_until(next_timeout).await;
                 },
                 ServerState::Follower => {
                     // 3. we are follower
@@ -254,131 +301,54 @@ impl Server {
     /// Get heartbeats and work out who is dead
     async fn incoming_packet_loop(self: Arc<Self>, mut incoming: Receiver<Packet>, outgoing: Sender<Packet>) -> Result<(), ConnectionError> {
         loop {
-
             let server_state = (*self.state.read().await).clone();
-            match server_state {
-                ServerState::Leader => {
-                    // 1. we are leader
-                        // nothing for now
-                    // TODO: read and discard packets off the wire
-                    let packet = incoming.recv().await.ok_or(ConnectionError)?;
+            let next_timeout = *self.term_timeout.read().await;
+            tokio::select! {
+                Some(packet) = incoming.recv() => {
+                    self.update_term(&packet).await;
                     match packet.message_type {
-                        AppendEntries => {
-                            let reply = self.handle_append(&packet).await;
-                            outgoing.send(reply).await.unwrap(); // TODO
-                        },
-                        AppendEntriesAck { .. } => {
-                            // TODO: commit in log
-                        },
                         VoteRequest { .. } => {
                             let reply = self.handle_voterequest(&packet).await;
                             outgoing.send(reply).await.unwrap(); // TODO
                         },
-                        _ => { error!(state = ?server_state, ?packet, "unexpected packet"); },
-                    }
-                },
-                ServerState::Candidate { election_ends_at } => {
-                    // 2. we are candidate
-                        // if we find a valid leader, become follower
-                        // become leader if we get majority of votes
-                    tokio::select! {
-                        received = incoming.recv() => match received {
-                            None => return Ok(()),
-                            Some(packet) => {
-                                // TODO: make this less naive
-                                match packet.message_type {
-                                    AppendEntries => {
-                                        let reply = self.handle_append(&packet).await;
-                                        outgoing.send(reply).await.unwrap(); // TODO
-                                    },
-                                    VoteResponse { is_granted } => {
-                                        let current_term = self.term.load(Ordering::Acquire);
-                                        info!(peer = ?packet.peer, term = ?packet.term, is_granted, "got a vote response");
-
-                                        let mut election_results = self.election_results.lock().await;
-
-                                        // store the result from the vote
-                                        election_results.insert(packet.peer, is_granted);
-
-                                        // count votes and nodes
-                                        // add 1 to each so we count ourselves
-                                        let vote_cnt = election_results.values().filter(|v| **v).count() + 1;
-                                        let node_cnt = self.peers.read().await.len() + 1;
-                                        info!(?vote_cnt, ?node_cnt, "vote count, node count");
-
-                                        // did we get more than half the votes, including our own?
-                                        if vote_cnt > node_cnt / 2 {
-                                            info!(votes = %vote_cnt, term = ?current_term, "won election; becoming Leader");
-                                            let mut state_mut = self.state.write().await;
-                                            *state_mut = ServerState::Leader;
-                                        }
-                                    },
-                                    _ => {
-                                        // do nothing with other packets, as we wait for timeout of the election
-                                    },
-                                }
+                        VoteResponse { .. } => {
+                            self.handle_voteresponse(&packet).await;
+                        },
+                        AppendEntries => {
+                            if let Some(reply) = self.handle_appendentries(&packet).await {
+                                outgoing.send(reply).await.unwrap(); // TODO
                             }
                         },
-                    
-                        // timer that goes off when election timed out
-                        // TODO: doesn't work
-                        _ = sleep_until(election_ends_at) => {
-                            info!("Election timeout; restarting election");
-                            self.start_election().await
-                        }
-
+                        AppendEntriesAck { .. } => {
+                            // TODO: commit in log
+                        },
                     }
                 },
-                ServerState::Follower => {
-                    // 3. we are follower
-                        // if we get a heartbeat, reset our timeout
-                        // if we timeout, become candidate
-                        // send vote if valid vote request
-
-                    let interval = self.get_term_timeout();
-                    tokio::select! {
-                        // process heartbeats from leader
-                        received = incoming.recv() => match received {
-                            None => return Ok(()),
-                            Some(packet) => {
-                                // TODO: make this less naive
-                                match packet.message_type {
-                                    AppendEntries => {
-                                        let reply = self.handle_append(&packet).await;
-                                        outgoing.send(reply).await.unwrap(); // TODO
-                                    },
-                                    VoteRequest { .. } => {
-                                        let reply = self.handle_voterequest(&packet).await;
-                                        outgoing.send(reply).await.unwrap(); // TODO
-                                    },
-                                    _ => { error!(state = ?server_state, ?packet, "unexpected packet"); },
-                                }
-                            },
-                        },
-
-                        // timer that goes off when leader timed out
-                        _ = sleep(interval) => {
-                            info!("Leader timeout after {:?}; becoming candidate", interval);
-                            self.start_election().await;
-                        }
-                    }
-                }
+                _ = sleep_until(next_timeout), if !matches!(server_state, ServerState::Leader) => {
+                    info!("Election timeout; restarting election");
+                    self.start_election().await
+                },
+                else => return Ok(()),  // No more packets, shutting down
             }
         } 
     }
 
     pub fn start(connection: impl Connection, peers: Vec<ServerAddress>, heartbeat_interval: Duration, election_timeout_min: Duration, election_timeout_max: Duration) -> Result<Arc<Self>, ConnectionError>
     {
+        let election_timeout_min = election_timeout_min.as_millis() as u64;
+        let election_timeout_max = election_timeout_max.as_millis() as u64;
+        let term_timeout = Self::generate_random_timeout(election_timeout_min, election_timeout_max);
         let server = Arc::new(Self {
             peers: RwLock::new(peers),
             state: RwLock::new(ServerState::Follower),
             // state_span: RwLock::new(None),
             term: AtomicU64::new(0),
+            term_timeout: RwLock::new(term_timeout),
             last_vote: Mutex::new(None),
             election_results: Mutex::new(HashMap::new()),
             heartbeat_millis: AtomicU64::new(heartbeat_interval.as_millis() as u64),
-            election_timeout_min: AtomicU64::new(election_timeout_min.as_millis() as u64),
-            election_timeout_max: AtomicU64::new(election_timeout_max.as_millis() as u64),
+            election_timeout_min: AtomicU64::new(election_timeout_min),
+            election_timeout_max: AtomicU64::new(election_timeout_max),
             tasks: Mutex::new(JoinSet::default()),
         });
 
